@@ -1,5 +1,5 @@
 #! /usr/bin/env perl
-# Copyright 2015-2025 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 2015-2026 The OpenSSL Project Authors. All Rights Reserved.
 #
 # Licensed under the Apache License 2.0 (the "License").  You may not use
 # this file except in compliance with the License.  You can obtain a copy
@@ -30,7 +30,7 @@ sub verify {
     run(app([@args]));
 }
 
-plan tests => 216;
+plan tests => 218;
 
 # Canonical success
 ok(verify("ee-cert", "sslserver", ["root-cert"], ["ca-cert"]),
@@ -623,6 +623,30 @@ run(app(["openssl", "verify",
          stderr => $cve_28388_stderr));
 ok(grep(/CRL is not yet valid/, do { open my $fh, '<', $cve_28388_stderr; <$fh> }),
    "CVE-2026-28388");
+
+# Issue #31040
+my $issue_31040_delta_stderr = "issue-31040-delta.err";
+ok(!run(app(["openssl", "verify", "-auth_level", "1",
+             "-CAfile", srctop_file(@certspath, "issue-31040-ca.pem"),
+             "-no_check_time", "-crl_check",
+             "-CRLfile", srctop_file(@certspath, "issue-31040-delta.pem"),
+             srctop_file(@certspath, "issue-31040-leaf.pem")],
+             stderr => $issue_31040_delta_stderr))
+   && grep(/unable to get certificate CRL/,
+           do { open my $fh, '<', $issue_31040_delta_stderr; <$fh> }),
+   "Delta CRL is not accepted as complete CRL");
+
+my $issue_31040_delta_reasons_stderr = "issue-31040-delta-reasons.err";
+ok(!run(app(["openssl", "verify", "-auth_level", "1",
+             "-CAfile", srctop_file(@certspath, "issue-31040-ca.pem"),
+             "-no_check_time", "-crl_check", "-extended_crl",
+             "-CRLfile",
+             srctop_file(@certspath, "issue-31040-delta-reasons.pem"),
+             srctop_file(@certspath, "issue-31040-leaf.pem")],
+             stderr => $issue_31040_delta_reasons_stderr))
+   && grep(/unable to get certificate CRL/,
+           do { open my $fh, '<', $issue_31040_delta_reasons_stderr; <$fh> }),
+   "Delta CRL with onlySomeReasons is not accepted as complete CRL");
 
 # CAstore option
 my $rootcertname = "root-cert";
