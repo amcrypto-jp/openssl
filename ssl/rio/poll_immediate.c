@@ -287,6 +287,23 @@ static int poll_translate_ssl_dtls_listener(SSL *ssl,
     return 1;
 }
 
+static int dtls_conn_has_queued_input(SSL *ssl)
+{
+    SSL_CONNECTION *sc = SSL_CONNECTION_FROM_SSL_ONLY(ssl);
+    int has_pending = 0;
+
+    if (sc == NULL || sc->d1 == NULL || sc->d1->listener == NULL)
+        return 0;
+    if (ossl_dtls_listener_has_pending_input(sc->d1->listener))
+        return 1;
+    if (sc->d1->rx != NULL) {
+        ossl_crypto_mutex_lock(sc->d1->rx->mutex);
+        has_pending = !ossl_list_urxe_is_empty(&sc->d1->rx->urxe_pending);
+        ossl_crypto_mutex_unlock(sc->d1->rx->mutex);
+    }
+    return has_pending;
+}
+
 static int poll_translate_ssl_dtls_conn(SSL *ssl,
     POLL_WAIT_CTX *wctx,
     RIO_POLL_BUILDER *rpb,
@@ -298,7 +315,6 @@ static int poll_translate_ssl_dtls_conn(SSL *ssl,
     int rfd = -1, wfd = -1, nfd = -1;
     SSL_CONNECTION *sc;
     DTLS_LISTENER *dl = NULL;
-    int has_pending;
 
     sc = SSL_CONNECTION_FROM_SSL_ONLY(ssl);
 
@@ -323,18 +339,9 @@ static int poll_translate_ssl_dtls_conn(SSL *ssl,
              * tick left input undriven on a pending connection: the socket
              * will not signal it, so tick again instead of sleeping.
              */
-            if (ossl_dtls_listener_has_pending_input(sc->d1->listener)) {
+            if (dtls_conn_has_queued_input(ssl)) {
                 *abort_blocking = 1;
                 return 1;
-            }
-            if (sc->d1->rx != NULL) {
-                ossl_crypto_mutex_lock(sc->d1->rx->mutex);
-                has_pending = !ossl_list_urxe_is_empty(&sc->d1->rx->urxe_pending);
-                ossl_crypto_mutex_unlock(sc->d1->rx->mutex);
-                if (has_pending) {
-                    *abort_blocking = 1;
-                    return 1;
-                }
             }
 
             /*
@@ -362,13 +369,7 @@ static int poll_translate_ssl_dtls_conn(SSL *ssl,
                      * after our initial check above but before we entered
                      * the blocking section. Re-check now.
                      */
-                    has_pending = ossl_dtls_listener_has_pending_input(sc->d1->listener);
-                    if (!has_pending && sc->d1->rx != NULL) {
-                        ossl_crypto_mutex_lock(sc->d1->rx->mutex);
-                        has_pending = !ossl_list_urxe_is_empty(&sc->d1->rx->urxe_pending);
-                        ossl_crypto_mutex_unlock(sc->d1->rx->mutex);
-                    }
-                    if (has_pending) {
+                    if (dtls_conn_has_queued_input(ssl)) {
                         *abort_blocking = 1;
                         return 1;
                     }
@@ -621,6 +622,39 @@ static int poll_translate(SSL_POLL_ITEM *items,
             FAIL_ITEM(i);
         }
     }
+
+#ifndef OPENSSL_NO_DTLS
+    {
+        size_t item_index;
+        uint64_t revents = 0;
+
+        /*
+         * Readout or translation can make another DTLS item ready by ticking
+         * a shared listener, leaving no input on the socket to wake a wait.
+         * Recheck after all translations, without ticking registered objects.
+         * Use a separate index so cleanup still covers every translated item.
+         */
+        for (item_index = 0; item_index < num_items; ++item_index) {
+            item = &ITEM_N(items, stride, item_index);
+            if (item->desc.type != BIO_POLL_DESCRIPTOR_TYPE_SSL)
+                continue;
+            ssl = item->desc.value.ssl;
+            if (IS_DTLS_LISTENER(ssl)) {
+                if (!ossl_dtls_listener_poll_events(ssl, item->events,
+                        /*do_tick=*/0, &revents))
+                    FAIL_ITEM(item_index);
+                if (revents != 0 || ossl_dtls_listener_has_pending_input(ssl))
+                    *abort_blocking = 1;
+            } else if (ssl != NULL && ssl->type == SSL_TYPE_SSL_CONNECTION
+                && SSL_is_dtls(ssl) && (item->events & SSL_POLL_EVENT_R) != 0
+                && dtls_conn_has_queued_input(ssl)) {
+                *abort_blocking = 1;
+            }
+            if (*abort_blocking)
+                break;
+        }
+    }
+#endif
 
 out:
     /*

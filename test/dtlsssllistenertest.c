@@ -8276,6 +8276,163 @@ end:
     return testresult;
 }
 
+static int redrive_accept_and_drain(REDRIVE_FIXTURE *fx, size_t i, SSL **server)
+{
+    int k;
+    char buf[16];
+
+    if (!redrive_send_ch2(fx, i))
+        return 0;
+    for (k = 0; k < 200
+        && SSL_get_accept_connection_queue_len(fx->listener) == 0;
+        k++) {
+        listener_tick(fx->listener);
+        OSSL_sleep(10);
+    }
+    if (!TEST_ptr(*server = SSL_accept_connection(fx->listener,
+                      SSL_ACCEPT_CONNECTION_NO_BLOCK))
+        || !TEST_true(create_ssl_connection(*server, fx->clients[i],
+            SSL_ERROR_NONE)))
+        return 0;
+
+    /* Drain any messages from the completed handshake. */
+    for (k = 0; k < 20; k++) {
+        if (!TEST_int_le(SSL_read(fx->clients[i], buf, sizeof(buf)), 0)
+            || !TEST_int_le(SSL_read(*server, buf, sizeof(buf)), 0))
+            return 0;
+        listener_tick(fx->listener);
+        OSSL_sleep(10);
+    }
+    ERR_clear_error();
+    return 1;
+}
+
+/*
+ * Translating an accepted connection can make a listener item ready, in
+ * either item order. SSL_POLL_FLAG_NO_HANDLE_EVENTS suppresses the initial
+ * ticks so the ClientHello is handled during connection translation.
+ * The final check must prevent a wait on the empty socket, including in
+ * SINGLE_THREAD mode. Bit 2 of idx swaps the item order.
+ */
+static int test_dtls_listener_poll_ready_after_translation(int idx)
+{
+    REDRIVE_FIXTURE fx;
+    int version, ret, testresult = 0, listener_index = (idx & 4) != 0;
+    uint64_t flags;
+    SSL *serverssl = NULL;
+    SSL_POLL_ITEM items[2] = { 0 };
+    struct timeval timeout = { REDRIVE_POLL_TIMEOUT_SEC, 0 };
+    size_t result_count = 0;
+    OSSL_TIME start;
+    DTLS_LISTENER *dl;
+
+    if ((ret = redrive_params(idx, &version, &flags)) >= 0)
+        return ret;
+    if (!redrive_setup(&fx, version, flags, 2)
+        || !redrive_accept_and_drain(&fx, 0, &serverssl))
+        goto end;
+    dl = (DTLS_LISTENER *)fx.listener;
+
+    if (!TEST_true(redrive_all_idle(dl, 1))
+        || !redrive_send_ch2(&fx, 1)
+        || !TEST_int_gt(BIO_socket_wait(fx.server_fd, 1, time(NULL) + 5), 0)
+        || !TEST_size_t_eq(SSL_get_accept_connection_queue_len(fx.listener), 0)
+        || !TEST_false(ossl_dtls_listener_has_pending_input(fx.listener)))
+        goto end;
+
+    items[listener_index].desc = SSL_as_poll_descriptor(fx.listener);
+    items[listener_index].events = SSL_POLL_EVENT_IC;
+    items[1 - listener_index].desc = SSL_as_poll_descriptor(serverssl);
+    items[1 - listener_index].events = SSL_POLL_EVENT_R;
+    start = ossl_time_now();
+    if (!TEST_true(SSL_poll(items, OSSL_NELEM(items), sizeof(items[0]),
+            &timeout, SSL_POLL_FLAG_NO_HANDLE_EVENTS, &result_count))
+        || !TEST_uint64_t_lt(ossl_time2seconds(ossl_time_subtract(ossl_time_now(),
+                                 start)),
+            REDRIVE_POLL_TIMEOUT_SEC / 2)
+        || !TEST_size_t_eq(result_count, 1)
+        || !TEST_uint64_t_eq(items[listener_index].revents, SSL_POLL_EVENT_IC)
+        || !TEST_uint64_t_eq(items[1 - listener_index].revents, 0)
+        || !TEST_size_t_eq(dl->cur_blocking_waiters, 0)
+        || !TEST_false(dl->signalled_notifier)
+        || !redrive_finish(&fx, 1))
+        goto end;
+
+    testresult = 1;
+end:
+    SSL_free(serverssl);
+    redrive_teardown(&fx);
+    return testresult;
+}
+
+/*
+ * Translating the second connection routes a datagram to the first, which
+ * must be rechecked before blocking. Each tick reads one datagram: queue
+ * junk from a third accepted connection ahead of the application data so
+ * the earlier ticks have no input for either polled connection. Bit 2 of
+ * idx enables the initial readout ticks.
+ */
+static int test_dtls_conn_poll_ready_after_translation(int idx)
+{
+    REDRIVE_FIXTURE fx;
+    int version, ret, testresult = 0, i;
+    uint64_t flags;
+    uint64_t poll_flags = (idx & 4) != 0 ? 0 : SSL_POLL_FLAG_NO_HANDLE_EVENTS;
+    int njunk = poll_flags != 0 ? 1 : 3;
+    SSL *servers[3] = { NULL, NULL, NULL };
+    SSL_POLL_ITEM items[2] = { 0 };
+    struct timeval timeout = { REDRIVE_POLL_TIMEOUT_SEC, 0 };
+    size_t result_count = 0;
+    OSSL_TIME start;
+    char buf[16];
+    DTLS_LISTENER *dl;
+
+    if ((ret = redrive_params(idx, &version, &flags)) >= 0)
+        return ret;
+    if (!redrive_setup(&fx, version, flags, 3)
+        || !redrive_accept_and_drain(&fx, 0, &servers[0])
+        || !redrive_accept_and_drain(&fx, 1, &servers[1])
+        || !redrive_accept_and_drain(&fx, 2, &servers[2]))
+        goto end;
+    dl = (DTLS_LISTENER *)fx.listener;
+    if (!TEST_true(redrive_all_idle(dl, 0)))
+        goto end;
+
+    for (i = 0; i < njunk; i++)
+        if (!redrive_send_junk(&fx, 2))
+            goto end;
+    if (!TEST_int_eq(SSL_write(fx.clients[0], "x", 1), 1)
+        || !TEST_int_gt(BIO_socket_wait(fx.server_fd, 1, time(NULL) + 5), 0))
+        goto end;
+
+    for (i = 0; i < 2; i++) {
+        items[i].desc = SSL_as_poll_descriptor(servers[i]);
+        items[i].events = SSL_POLL_EVENT_R;
+    }
+    start = ossl_time_now();
+    if (!TEST_true(SSL_poll(items, OSSL_NELEM(items), sizeof(items[0]),
+            &timeout, poll_flags, &result_count))
+        || !TEST_uint64_t_lt(ossl_time2seconds(ossl_time_subtract(ossl_time_now(),
+                                 start)),
+            REDRIVE_POLL_TIMEOUT_SEC / 2)
+        || !TEST_size_t_eq(result_count, 1)
+        || !TEST_uint64_t_eq(items[0].revents, SSL_POLL_EVENT_R)
+        || !TEST_uint64_t_eq(items[1].revents, 0)
+        || !TEST_size_t_eq(dl->cur_blocking_waiters, 0)
+        || !TEST_false(dl->signalled_notifier)
+        || !TEST_int_eq(SSL_read(servers[0], buf, sizeof(buf)), 1)
+        || !TEST_char_eq(buf[0], 'x'))
+        goto end;
+
+    testresult = 1;
+end:
+    SSL_free(servers[0]);
+    SSL_free(servers[1]);
+    SSL_free(servers[2]);
+    redrive_teardown(&fx);
+    return testresult;
+}
+
 /* Fails every receive permanently */
 static int failing_recv_recvmmsg(BIO *bio, BIO_MSG *msg, size_t stride,
     size_t num_msg, uint64_t flags, size_t *msgs_processed)
@@ -8609,6 +8766,8 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_dtls_listener_redrive, 16);
     ADD_ALL_TESTS(test_dtls_listener_redrive_driven_earlier, 4);
     ADD_ALL_TESTS(test_dtls_listener_conn_poll_pending_input, 4);
+    ADD_ALL_TESTS(test_dtls_listener_poll_ready_after_translation, 8);
+    ADD_ALL_TESTS(test_dtls_conn_poll_ready_after_translation, 8);
     ADD_TEST(test_dtls_listener_fatal_no_pending_input);
 #endif
 #ifndef OPENSSL_NO_DTLS1_3
