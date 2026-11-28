@@ -122,8 +122,15 @@ int main(int argc, char *argv[])
     int setup_res;
     int gi_ret;
 
+    /*
+     * Install the hooks before global_init() or test_open_streams() can
+     * allocate. Use stderr directly until the testutil streams are open.
+     */
     if (mfail_install(0) < 0) {
-        test_printf_stderr("MFAIL installation failed - aborting\n");
+        fprintf(stderr,
+            "# MFAIL installation failed - aborting\n"
+            "# libcrypto's default allocator was used before main().\n"
+            "# Set OPENSSL_TEST_MFAIL_DISABLE=1 to run without mfail.\n");
         return ret;
     }
 

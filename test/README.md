@@ -231,6 +231,14 @@ tolerated since a function may legitimately fail when an allocation fails.
 Returning -1 forces a failure that is reported even under `NO_CHECK`, for
 assertions that must hold regardless of which allocation was made to fail.
 
+Testutil installs the mfail hooks at the start of `main()`. If a constructor
+in the test or a linked library uses libcrypto's default allocator before
+then, for example to initialize a C++ global object, hook installation fails.
+The test program reports the failure on stderr and exits with `EXIT_FAILURE`.
+A test that needs a pre-main allocation can use a dedicated executable and set
+`OPENSSL_TEST_MFAIL_DISABLE=1` for that invocation. This preserves allocation
+failure injection for the other tests.
+
 Behavior is controlled with the following environment variables:
 
     OPENSSL_TEST_MFAIL_DISABLE=1    Disable mfail custom allocator installation.
